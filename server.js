@@ -1,206 +1,175 @@
-import express from 'express';
-import cors from 'cors';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import { createClient } from '@supabase/supabase-js';
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 10000;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const url = process.env.SUPABASE_URL;
+const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !ADMIN_PASSWORD || !JWT_SECRET) {
-  console.warn('Missing required environment variables. Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ADMIN_PASSWORD and JWT_SECRET.');
+if (!url || !key || !ADMIN_PASSWORD || !JWT_SECRET) {
+  console.error("Missing required env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY), ADMIN_PASSWORD, JWT_SECRET");
+  process.exit(1);
 }
 
-const db = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
-  : null;
+const supabase = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+const T = {
+  accessKeys: process.env.ACCESS_KEYS_TABLE || "access_keys",
+  users: process.env.USERS_TABLE || "Users",
+  deposits: process.env.DEPOSITS_TABLE || "Deposit",
+  withdrawals: process.env.WITHDRAWALS_TABLE || "Withdrawal",
+  subPanels: process.env.SUBPANELS_TABLE || "sub_panels",
+  settings: process.env.SETTINGS_TABLE || "app_settings"
+};
 
-const ok = (res, data) => res.json({ ok: true, data });
-const fail = (res, code, message) => res.status(code).json({ ok: false, error: message });
-
-function requireConfig(req, res, next) {
-  if (!db) return fail(res, 500, 'Server is not configured');
-  next();
+function makeKey() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const part = () => Array.from({ length: 4 }, () => chars[crypto.randomInt(0, chars.length)]).join("");
+  return `${part()}-${part()}-${part()}`;
 }
-function adminAuth(req, res, next) {
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+function signAdmin() { return jwt.sign({ role: "admin" }, JWT_SECRET, { expiresIn: "12h" }); }
+function auth(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (payload.type !== 'admin') throw new Error('bad token');
-    req.admin = payload;
-    next();
-  } catch { return fail(res, 401, 'Admin authentication required'); }
+    const p = jwt.verify(token, JWT_SECRET);
+    if (p.role !== "admin") throw new Error("forbidden");
+    req.admin = p; next();
+  } catch (_) { return res.status(401).json({ ok: false, error: "Unauthorized" }); }
 }
-function subAuth(req, res, next) {
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+function cleanStatus(v) { return String(v || "").toLowerCase(); }
+
+app.get("/", (req, res) => res.json({ ok: true, name: "AI SUPER PREDICTOR Backend", status: "online" }));
+app.get("/api/health", (req, res) => res.json({ ok: true, status: "online" }));
+
+app.post("/api/admin/login", (req, res) => {
+  if (String(req.body?.password || "") !== ADMIN_PASSWORD)
+    return res.status(401).json({ ok: false, error: "Invalid admin password" });
+  res.json({ ok: true, token: signAdmin() });
+});
+
+app.post("/api/access-keys", auth, async (req, res) => {
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (payload.type !== 'subpanel') throw new Error('bad token');
-    req.subpanel = payload;
-    next();
-  } catch { return fail(res, 401, 'Sub panel login required'); }
-}
-
-function panelAuth(permission) {
-  return (req, res, next) => {
-    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    try {
-      const p = jwt.verify(token, JWT_SECRET);
-      if (p.type === 'admin' || (p.type === 'subpanel' && (!permission || p.permissions?.[permission]))) {
-        req.panel = p; return next();
-      }
-      throw new Error('denied');
-    } catch { return fail(res, 401, 'Authentication or permission required'); }
-  };
-}
-
-function requirePermission(name) {
-  return (req, res, next) => {
-    if (!req.subpanel?.permissions?.[name]) return fail(res, 403, 'Permission denied');
-    next();
-  };
-}
-
-app.get('/health', (req, res) => ok(res, { service: 'AI SUPER PREDICTOR backend', time: new Date().toISOString() }));
-
-app.post('/api/admin/login', (req, res) => {
-  const username = String(req.body?.username || '');
-  const password = String(req.body?.password || '');
-  if (!ADMIN_PASSWORD) return fail(res, 500, 'Admin password is not configured');
-  if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) return fail(res, 401, 'Invalid admin username or password');
-  const token = jwt.sign({ type: 'admin', username }, JWT_SECRET, { expiresIn: '12h' });
-  ok(res, { token, username });
+    const days = Math.max(1, Number(req.body?.days || 1));
+    const expires_at = req.body?.expires_at || new Date(Date.now() + days * 86400000).toISOString();
+    const row = { key: makeKey(), status: "active", expires_at };
+    const { data, error } = await supabase.from(T.accessKeys).insert(row).select().single();
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+    res.json({ ok: true, data });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+app.get("/api/access-keys", auth, async (req, res) => {
+  const { data, error } = await supabase.from(T.accessKeys).select("*").order("id", { ascending: false });
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
+});
+app.post("/api/access-keys/check", async (req, res) => {
+  try {
+    const k = String(req.body?.key || "").trim().toUpperCase();
+    if (!k) return res.status(400).json({ ok: false, valid: false, error: "Key required" });
+    const { data, error } = await supabase.from(T.accessKeys).select("*").eq("key", k).maybeSingle();
+    if (error) return res.status(400).json({ ok: false, valid: false, error: error.message });
+    if (!data) return res.json({ ok: true, valid: false, reason: "not_found" });
+    if (cleanStatus(data.status) !== "active") return res.json({ ok: true, valid: false, reason: "disabled", data });
+    if (data.expires_at && new Date(data.expires_at).getTime() < Date.now()) return res.json({ ok: true, valid: false, reason: "expired", data });
+    res.json({ ok: true, valid: true, data });
+  } catch (e) { res.status(500).json({ ok: false, valid: false, error: e.message }); }
+});
+app.patch("/api/access-keys/:id", auth, async (req, res) => {
+  const status = cleanStatus(req.body?.status || "disabled");
+  const { data, error } = await supabase.from(T.accessKeys).update({ status }).eq("id", req.params.id).select().single();
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
 });
 
-// ---------- Sub Panels ----------
-app.get('/api/subpanels', requireConfig, adminAuth, async (req, res) => {
-  const { data, error } = await db.from('sub_panels').select('id,name,username,active,permissions,created_at').order('id', { ascending: false });
-  if (error) return fail(res, 500, error.message);
-  ok(res, data || []);
+app.get("/api/users", auth, async (req, res) => {
+  const { data, error } = await supabase.from(T.users).select("*").order("uid", { ascending: true });
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
+});
+app.patch("/api/users/:uid/lock", auth, async (req, res) => {
+  const locked = Boolean(req.body?.locked);
+  const update = { status: locked ? "locked" : "active", lock_reason: locked ? (req.body?.reason || null) : null };
+  const { data, error } = await supabase.from(T.users).update(update).eq("uid", req.params.uid).select().single();
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
 });
 
-app.post('/api/subpanels', requireConfig, adminAuth, async (req, res) => {
-  const { name, username, password, permissions = {} } = req.body || {};
-  if (!name || !username || !password) return fail(res, 400, 'Name, username and password are required');
-  const password_hash = await bcrypt.hash(password, 12);
-  const row = { name: String(name).trim(), username: String(username).trim().toLowerCase(), password_hash, active: true, permissions };
-  const { data, error } = await db.from('sub_panels').insert(row).select('id,name,username,active,permissions,created_at').single();
-  if (error) return fail(res, error.code === '23505' ? 409 : 500, error.code === '23505' ? 'Username already exists' : error.message);
-  ok(res, data);
+app.get("/api/deposits", auth, async (req, res) => {
+  const { data, error } = await supabase.from(T.deposits).select("*").order("id", { ascending: false });
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
+});
+app.patch("/api/deposits/:id", auth, async (req, res) => {
+  const status = cleanStatus(req.body?.status);
+  if (!["approved", "rejected", "pending"].includes(status)) return res.status(400).json({ ok: false, error: "Invalid status" });
+  const { data, error } = await supabase.from(T.deposits).update({ status }).eq("id", req.params.id).select().single();
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
 });
 
-app.patch('/api/subpanels/:id', requireConfig, adminAuth, async (req, res) => {
-  const patch = {};
-  if (typeof req.body.active === 'boolean') patch.active = req.body.active;
-  if (req.body.permissions && typeof req.body.permissions === 'object') patch.permissions = req.body.permissions;
-  if (!Object.keys(patch).length) return fail(res, 400, 'Nothing to update');
-  const { data, error } = await db.from('sub_panels').update(patch).eq('id', req.params.id).select('id,name,username,active,permissions,created_at').single();
-  if (error) return fail(res, 500, error.message);
-  ok(res, data);
+app.get("/api/withdrawals", auth, async (req, res) => {
+  const { data, error } = await supabase.from(T.withdrawals).select("*").order("id", { ascending: false });
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
+});
+app.patch("/api/withdrawals/:id", auth, async (req, res) => {
+  const status = cleanStatus(req.body?.status);
+  if (!["approved", "rejected", "pending"].includes(status)) return res.status(400).json({ ok: false, error: "Invalid status" });
+  const { data, error } = await supabase.from(T.withdrawals).update({ status }).eq("id", req.params.id).select().single();
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
 });
 
-app.delete('/api/subpanels/:id', requireConfig, adminAuth, async (req, res) => {
-  const { error } = await db.from('sub_panels').delete().eq('id', req.params.id);
-  if (error) return fail(res, 500, error.message);
-  ok(res, true);
+app.get("/api/sub-panels", auth, async (req, res) => {
+  const { data, error } = await supabase.from(T.subPanels).select("id,name,username,active,permissions,created_at").order("id", { ascending: false });
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
+});
+app.post("/api/sub-panels", auth, async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const username = String(req.body?.username || "").trim();
+    const password = String(req.body?.password || "");
+    if (!name || !username || !password) return res.status(400).json({ ok: false, error: "Name, username and password required" });
+    const password_hash = await bcrypt.hash(password, 12);
+    const permissions = req.body?.permissions || {};
+    const { data, error } = await supabase.from(T.subPanels).insert({ name, username, password_hash, active: true, permissions }).select("id,name,username,active,permissions,created_at").single();
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+    res.json({ ok: true, data });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+app.patch("/api/sub-panels/:id", auth, async (req, res) => {
+  const update = {};
+  if (typeof req.body?.active === "boolean") update.active = req.body.active;
+  if (req.body?.permissions) update.permissions = req.body.permissions;
+  const { data, error } = await supabase.from(T.subPanels).update(update).eq("id", req.params.id).select("id,name,username,active,permissions,created_at").single();
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true, data });
+});
+app.delete("/api/sub-panels/:id", auth, async (req, res) => {
+  const { error } = await supabase.from(T.subPanels).delete().eq("id", req.params.id);
+  if (error) return res.status(400).json({ ok: false, error: error.message });
+  res.json({ ok: true });
+});
+app.post("/api/sub-panels/login", async (req, res) => {
+  try {
+    const username = String(req.body?.username || "").trim();
+    const password = String(req.body?.password || "");
+    const { data, error } = await supabase.from(T.subPanels).select("id,name,username,password_hash,active,permissions").eq("username", username).maybeSingle();
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+    if (!data || !data.active || !(await bcrypt.compare(password, data.password_hash))) return res.status(401).json({ ok: false, error: "Invalid username/password" });
+    const token = jwt.sign({ role: "subpanel", subpanel_id: data.id, username: data.username, permissions: data.permissions || {} }, JWT_SECRET, { expiresIn: "12h" });
+    res.json({ ok: true, token, data: { id: data.id, name: data.name, username: data.username, permissions: data.permissions || {} } });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-app.post('/api/subpanels/login', requireConfig, async (req, res) => {
-  const username = String(req.body?.username || '').trim().toLowerCase();
-  const password = String(req.body?.password || '');
-  if (!username || !password) return fail(res, 400, 'Username and password are required');
-  const { data, error } = await db.from('sub_panels').select('id,name,username,password_hash,active,permissions').eq('username', username).maybeSingle();
-  if (error) return fail(res, 500, error.message);
-  if (!data || !data.active || !(await bcrypt.compare(password, data.password_hash))) return fail(res, 401, 'Invalid username or password');
-  const token = jwt.sign({ type: 'subpanel', id: data.id, username: data.username, permissions: data.permissions || {} }, JWT_SECRET, { expiresIn: '12h' });
-  ok(res, { token, subpanel: { id: data.id, name: data.name, username: data.username, permissions: data.permissions || {} } });
-});
-
-app.get('/api/me', subAuth, (req, res) => ok(res, req.subpanel));
-
-// ---------- Access Keys ----------
-app.get('/api/keys', requireConfig, panelAuth('keys'), async (req, res) => {
-  const { data, error } = await db.from('access_keys').select('*').order('id', { ascending: false });
-  if (error) return fail(res, 500, error.message);
-  ok(res, data || []);
-});
-app.post('/api/keys', requireConfig, adminAuth, async (req, res) => {
-  const { key, uid = '', expires, active = true } = req.body || {};
-  if (!key || !expires) return fail(res, 400, 'key and expires are required');
-  const { data, error } = await db.from('access_keys').insert({ key, uid, expires, active }).select('*').single();
-  if (error) return fail(res, error.code === '23505' ? 409 : 500, error.message);
-  ok(res, data);
-});
-app.patch('/api/keys/:id', requireConfig, adminAuth, async (req, res) => {
-  const { data, error } = await db.from('access_keys').update({ active: !!req.body.active }).eq('id', req.params.id).select('*').single();
-  if (error) return fail(res, 500, error.message);
-  ok(res, data);
-});
-
-// ---------- Users / Locks ----------
-app.get('/api/locks', requireConfig, panelAuth('users'), async (req, res) => {
-  const { data, error } = await db.from('user_locks').select('*').order('id', { ascending: false });
-  if (error) return fail(res, 500, error.message);
-  ok(res, data || []);
-});
-app.post('/api/locks', requireConfig, panelAuth('users'), async (req, res) => {
-  const { uid, reason } = req.body || {};
-  if (!uid || !reason) return fail(res, 400, 'UID and reason are required');
-  const { data, error } = await db.from('user_locks').insert({ uid, reason }).select('*').single();
-  if (error) return fail(res, 500, error.message);
-  ok(res, data);
-});
-app.delete('/api/locks/:id', requireConfig, panelAuth('users'), async (req, res) => {
-  const { error } = await db.from('user_locks').delete().eq('id', req.params.id);
-  if (error) return fail(res, 500, error.message);
-  ok(res, true);
-});
-
-// ---------- Deposits / Withdrawals ----------
-app.get('/api/deposits', requireConfig, panelAuth('deposit'), async (req, res) => {
-  const { data, error } = await db.from('Deposit').select('*').order('id', { ascending: false });
-  if (error) return fail(res, 500, error.message);
-  ok(res, data || []);
-});
-app.patch('/api/deposits/:id', requireConfig, panelAuth('deposit'), async (req, res) => {
-  const status = String(req.body?.status || '');
-  if (!['Approved', 'Rejected', 'approved', 'rejected'].includes(status)) return fail(res, 400, 'Invalid status');
-  const { data, error } = await db.from('Deposit').update({ status: status[0].toUpperCase() + status.slice(1).toLowerCase() }).eq('id', req.params.id).select('*').single();
-  if (error) return fail(res, 500, error.message);
-  ok(res, data);
-});
-app.get('/api/withdrawals', requireConfig, panelAuth('withdraw'), async (req, res) => {
-  const { data, error } = await db.from('Withdrawal').select('*').order('id', { ascending: false });
-  if (error) return fail(res, 500, error.message);
-  ok(res, data || []);
-});
-app.patch('/api/withdrawals/:id', requireConfig, panelAuth('withdraw'), async (req, res) => {
-  const status = String(req.body?.status || '');
-  if (!['Approved', 'Rejected', 'approved', 'rejected'].includes(status)) return fail(res, 400, 'Invalid status');
-  const { data, error } = await db.from('Withdrawal').update({ status: status[0].toUpperCase() + status.slice(1).toLowerCase() }).eq('id', req.params.id).select('*').single();
-  if (error) return fail(res, 500, error.message);
-  ok(res, data);
-});
-
-// ---------- Admin settings (support + DP list) ----------
-app.get('/api/settings', requireConfig, adminAuth, async (req, res) => {
-  const { data, error } = await db.from('admin_settings').select('*').order('key');
-  if (error) return fail(res, 500, error.message);
-  ok(res, Object.fromEntries((data || []).map(x => [x.key, x.value])));
-});
-app.put('/api/settings/:key', requireConfig, adminAuth, async (req, res) => {
-  const { data, error } = await db.from('admin_settings').upsert({ key: req.params.key, value: req.body?.value ?? null }).select('*').single();
-  if (error) return fail(res, 500, error.message);
-  ok(res, data);
-});
-
-app.use((req, res) => fail(res, 404, 'Route not found'));
-app.listen(PORT, () => console.log(`AI SUPER PREDICTOR backend listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
