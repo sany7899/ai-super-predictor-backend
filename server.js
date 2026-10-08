@@ -443,7 +443,7 @@ app.get("/api/users", auth, async (req, res) => {
   const { data, error } = await supabase
     .from(T.users)
     .select("*")
-    .order("uid", { ascending: true });
+    .order("Uid", { ascending: true });
 
   if (error) {
     return res.status(400).json({
