@@ -469,7 +469,7 @@ app.patch("/api/users/:uid/lock", auth, async (req, res) => {
   const { data, error } = await supabase
     .from(T.users)
     .update(update)
-    .eq("uid", req.params.uid)
+    .eq("Uid", req.params.Uid)
     .select()
     .single();
 
